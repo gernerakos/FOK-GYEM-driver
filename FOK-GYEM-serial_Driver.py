@@ -297,23 +297,23 @@ def process_image(image_array):                 #this is where it gets nasty. Ta
         tmp_array1 = image_array[:96]
         tmp_array2 = image_array[96:]
 
-        for column in tmp_array1:
+for column in tmp_array1:
 
-            tmp = bin_to_ascii(column[:8])          #convert from binary data to hex values
+            tmp = bin_to_ascii(column[8:])          #convert from binary data to hex values
             image_array_block_1.append(tmp[0])      #top
             image_array_block_1.append(tmp[1])
 
-            tmp = bin_to_ascii(column[8:])          #convert from binary data to hex values
+            tmp = bin_to_ascii(column[:8])          #convert from binary data to hex values
             image_array_block_3.append(tmp[0])      #top
             image_array_block_3.append(tmp[1])
             
 
         for column in tmp_array2:
-            tmp = bin_to_ascii(column[:8])          #convert from binary data to hex values
+            tmp = bin_to_ascii(column[8:])          #convert from binary data to hex values
             image_array_block_2.append(tmp[0])      #top
             image_array_block_2.append(tmp[1])
 
-            tmp = bin_to_ascii(column[8:])          #convert from binary data to hex values
+            tmp = bin_to_ascii(column[:8])          #convert from binary data to hex values
             image_array_block_4.append(tmp[0])      #top
             image_array_block_4.append(tmp[1])
 
