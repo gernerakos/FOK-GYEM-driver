@@ -273,7 +273,7 @@ def process_image(image_array):                 #this is where it gets nasty. Ta
         block_list.append(image_array_block_1)
         block_list.append(image_array_block_2)
 
-    # ------------------------ CASE 4 -------------------------- #untested but more common case 
+    # ------------------------ CASE 4 -------------------------- # TESTED OK 
     elif display_height > 8 and display_width > 96:
         block_number = 4
         print("case 4")
