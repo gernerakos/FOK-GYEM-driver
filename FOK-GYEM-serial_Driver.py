@@ -1,38 +1,107 @@
 import serial
 import sys
-import binascii
 from time import sleep
 import numpy as np
 ser = serial.Serial()
-ser.baudrate = 19200
-ser.parity=serial.PARITY_SPACE
-ser.stopbits=serial.STOPBITS_TWO
+
 ser.timeout=3
-STX = 0x02
+STX = 2
 ETX = 0x03
+
+global VMX_STX, VMX_ETX
+VMX_STX = 0x78
+VMX_ETX = 0
+
+display_address = 31
 
 global common_delay
 common_delay = 0.3
 
-#common messages for all displays
+global current_protocol 
+current_protocol = None
 
-VALID_COMMANDS = {"Clear": [0x30, 0x30, 0x30, 0x32, 0x30, 0x42],
+#common messages
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+
+##Clear = ()
+##Selftest = ()
+##Selftest: [0x30, 0x30, 0x30, 0x34, 0x31, 0x46, 0x30, 0x31]
+##Pictest: [0x30, 0x30, 0x30, 0x34, 0x31, 0x46, 0x30, 0x32]
+
+
+#02 91 03
+
+FGY_VALID_COMMANDS = {"Clear": [0x30, 0x30, 0x30, 0x32, 0x30, 0x42],
                   "Selftest": [0x30, 0x30, 0x30, 0x34, 0x31, 0x46, 0x30, 0x31],
                   "Pictest": [0x30, 0x30, 0x30, 0x34, 0x31, 0x46, 0x30, 0x32],
                   "image_start": [0x30, 0x30, 0x30, 0x32, 0x30, 0x43],
                   "image_end": [0x30, 0x30, 0x30, 0x32, 0x31, 0x34]
 }
 
+VMX_VALID_COMMANDS = {"Clear": [0x00, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00],
+                  "Selftest": [0x00, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x02, 0x00, 0x00, 0x00, 0x00],
+                  "Clear memory": [0x00, 0x10, 0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0xFF, 0x00, 0x00, 0x00, 0x00],
+                  "image_start": [0x00, 0x10, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46, 0x01, 0x00, 0x00, 0x00, 0x00],
+                  "image_end": [0x00, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00], 
+                  "ack_req": [0x00, 0x10, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00], 
+}
+#all messages start with STX
+#followed by the display address, after adding 32 to it, and multiplying the result with 4.
+#the resulted hexadecimal value's each character's corresponding ASCII value is sent to the display
+#this is followed by the message itself, more on this later
+#each message closes with the CRC bytes, wich is calculated as following:
+#the CRC adds all values before the CRC bytes, except for the first byte (STX byte)
+#this sum of values is then decreased by 256.
+#as in the display address, the resulted CRC value's each character's corresponding ASCII values are added to
+#the end of the message. This is usually two bytes.
+#the message is closed with the ETX wich is not part of the CRC.
 
-def open_port(port):        #opens the selected serial port. input paramter example: "COM3"
+#final message is as follows (value[length])
+#STX[1], address[1], address[2], message[varying], CRC[1], CRC[2], ETX
+
+#step 1:
+#   calculate display address
+#step 2:
+#   add address to message
+#step 3:
+#   calculate CRC
+#step 4:
+#    add STX and EXT bytes
+#step 5:
+#    send data on serial
+
+def open_port(port):
 
     try:
         ser.port = port
         ser.open()
     except serial.serialutil.SerialException:
         raise ConnectionRefusedError 
+    else:
+        print("[SERIAL DRIVER]: serial port opened on", port)
 
-def serial_ports():         #returns a list containing all available serial ports. stolen from stackoverflow. THANKS!
+def close_port(port):
+
+    try:
+        ser.port = port
+        ser.close()
+    except serial.serialutil.SerialException:
+        raise ConnectionRefusedError 
+    else:
+        print("[SERIAL DRIVER]: serial port closed on", port)
+
+def serial_ports():
     """ Lists serial port names
 
         :raises EnvironmentError:
@@ -60,23 +129,56 @@ def serial_ports():         #returns a list containing all available serial port
             pass
     return result
 
-def req_ack(address):       #sends and ACK request to the given display and displays the response wich should be 0306 if the display is available
+def custom_readline(ser, eol=b'\n'):
+    """
+    Reads from the serial port until the specified end-of-line character is found.
+    
+    :param ser: The serial port object.
+    :param eol: The end-of-line character to look for. Default is newline (`\n`).
+    :return: The read line as a bytes object.
+    """
+    line = bytearray()
+
+    timeout = 0
+
+    while True:
+        timeout += 1
+        char = ser.read(1)
+        line += char
+        if char == eol:
+            break
+
+        if timeout == 1000:
+            print("[SERIAL DRIVER] FGY ACK timeout error")
+            return b''
+
+
+    hex_array = [format(byte, '02x') for byte in line]
+    return hex_array
+
+def FGY_req_ack(address):
     global STX, ETX
-    display_address = list(convert_address(address))  #convert to protocol address from physical address
-    display_address[1] = display_address[1]+1
-    result = [0x02, display_address[0], display_address[1], 0x03]   #add framing
-    
-    for i in result:
-        ser.write(bytes(i)) #convert to bytes and write to serial port
-        print(hex(i))
 
+    protocol_manager(" FOK-GYEM (bkv)")
 
-    byte = ser.read()  #read 4 bites of the response data
-    print(byte)
-    
-    
+    conv_address = FGY_convert_address(address)
 
-def byte_split(hex_string): #converts the inputs string of a hexadecimal value to the two ASCII values representing the characters of the input string. param: one string of characters representing a hex value
+    result = ['0x02', hex(conv_address[0]), hex(conv_address[1]+1), '0x03']
+
+    data_to_send = bytes([int(value, 16) for value in result])
+
+    ser.write(data_to_send)
+    # Read a single line using the custom EOL character
+    resp = ser.read(2)
+
+    if resp == b'' or []:
+        print("[SERIAL DRIVER] FGY ACK Response from {}: ".format(address), "NG")
+        return "NG"
+    else:
+        print("[SERIAL DRIVER] FGY ACK Response from {}: ".format(address), "OK")
+        return "OK"
+
+def FGY_byte_split(hex_string): #param: one string of characters representing a hex value
     # Remove the '0x' prefix if it exists
     if hex_string.startswith('0x'):
         hex_string = hex_string[2:]
@@ -87,17 +189,17 @@ def byte_split(hex_string): #converts the inputs string of a hexadecimal value t
     decimal_value = int(hex_string, 16)
 
     # Convert decimal value to ASCII characters
-    ascii_values = tuple(ord(char) for char in hex_string)      #i have a SLIGHT feeling this function could be optimised
+    ascii_values = tuple(ord(char) for char in hex_string)
 
     return ascii_values
 
-def convert_address(display_address):   #takes a decimal integer as input and calculates the display's address bytes as described by the protocoll
+def FGY_convert_address(display_address):   #takes a decimal integer as input and calculates the display's address bytes as described by the protocoll
     display_address = hex((display_address+32)*4).upper()
     display_address = (ord(display_address[-2])), ord(display_address[-1])
     
     return display_address
 
-def bin_to_ascii(arr):      #takes an 8 bit long binary number (ex: 0b01011000) and coverts it to two ASCII values of the top and bottom 4 bits.
+def FGY_bin_to_ascii(arr):
         # Check if the array has at least 4 elements
         if len(arr) < 4:
             return None, None  # Not enough values in the array
@@ -117,20 +219,20 @@ def bin_to_ascii(arr):      #takes an 8 bit long binary number (ex: 0b01011000) 
 
         return first_result, last_result
     
-def calculate_checksum(values):      #calculates the checksum bytes of the input wich must be a list containing hex or dec values. the input must already contain the STX byte, but not the EXT.
+def FGY_calculate_checksum(values):      #calculates the CRC bytes of the input wich must be a list containing hex or dec values
     #print(values)
     try:
         if len(values) < 2:
             raise ValueError("The input list must contain at least two decimal values.")
         
-        # Add all values except the first one. this is where we skip the STX byte.
+        # Add all values except the first one.
         chksum = sum(values[1:])
         
         
         # Subtract 256 from the sum.
         chksum_result = chksum - 256
         
-        # Ensure the result is within the range of 0-255,.
+        # Ensure the result is within the range of 0-255.
         #crc_result = crc_result % 256
         
         # Split the last two digits into separate digits
@@ -147,10 +249,10 @@ def calculate_checksum(values):      #calculates the checksum bytes of the input
     except ValueError as e:
         return str(e)
 
-def send(cmd_bytes, address=31):    #one of the most important functions. param: cmd_bytes: a list of hexa values containing the command desired to be sent, for example from the VALID_COMMANDS list
+def FGY_send_command(cmd_bytes, address=31):
 
     #calculate display address according to protocol            
-    disp_addr= convert_address(address)
+    disp_addr= FGY_convert_address(address)
 
     #add header (STX, address)
     result = [2]
@@ -162,124 +264,147 @@ def send(cmd_bytes, address=31):    #one of the most important functions. param:
         result.append(i)
         
     #add footer (Checksum, ETX)
-    crc = calculate_checksum(result)
+    crc = FGY_calculate_checksum(result)
     result.append(crc[0])
     result.append(crc[1])
-    result.append(3)    #ETX
+    result.append(3)
     
-    hex_values = [hex(value)[2:].zfill(2) for value in result] #removes the "0x" from every hexa bytes
+    hex_values = [hex(value)[2:].zfill(2) for value in result]
 
-
-    # Send the hexadecimal values as bytes to the serial port. FINALLY we are sending something
+    # FGY_send_command the hexadecimal values as bytes to the serial port.
     for hex_value in hex_values:
         ser.write(bytes.fromhex(hex_value))
         #print(f"Sent: 0x{hex_value}")
         ()
 
-def process_image(image_array):                 #this is where it gets nasty. Takes an 2D array as input wich must be 1:1 the size of the display
-    block_number = 1                            #then it decides if the display is so large, that the display data must be split into blocks.
-    block_list = list()                         #it currently contains untested parts as I dont have displays on hand for all 4 cases
-    hex_image_array = list()
+def FGY_process_image(image_array):
+    #print("passed on as:\n",image_array)
+    block_list = list()
 
-    display_width = len(image_array)            #the 2D array's top array must be the width of the display
-    display_height = len(image_array[0])        #we take the 1st sub array's length as the height. As all columns must be the same height this must be no problem
+    display_width = len(image_array)
+    display_height = len(image_array[0])
+
+    
 
     #check if it is necessary to split into blocks:
     
     #managing blocks
     """
-    1) display height under 8 pixels, and width less than or equal to 96 pixels
-    2) display height taller than 8 pixels, and width less than or equal to 96
-    3) display height less than 8 pixels,but wider than 96 pixels ( a VERY rare CASE)
-    4) dispaly height taller than 8 pixels and wider than 96 pixels"""
+    1) display height under 8 pixels, and width less than 100 pixels
+    2) display height equal to or under 16 pixels, width equal to or under 32 pixels
+    3) display height taller than 8 pixels, and width less than 100
+    4) display height less than 8 pixels,but wider than 100 pixels
+    5) dispaly height taller than 8 pixels and wider than 100 pixels"""
 
-    # ------------------------- CASE 1 ------------------------- TESTED OK
+    # ------------------------- CASE 1 ------------------------- 
     if display_height <= 8 and display_width <= 96:
-        print("case 1")
         if display_height == 7:
             extra_column  = np.zeros((display_width,1))
             image_array = np.hstack((extra_column, image_array))              #7 pixel tall displays appear as 8 pixels tall accroding to the protocol, and the last, "phantom" pixel is always 0
     
-        block_length = byte_split(hex(display_width*2))
+        block_length = FGY_byte_split(hex(display_width*2))
         
-        image_array_block_1 = [48,49]       #block IDs
+        image_array_block_1 = [48,49]
         for i in block_length:
-            image_array_block_1.append(i)   #block lengths
+            image_array_block_1.append(i)
                                
         for column in image_array:           #convert from binary data to hex values
-            tmp = bin_to_ascii(column)
+            tmp = FGY_bin_to_ascii(column)
             image_array_block_1.append(tmp[0])
             image_array_block_1.append(tmp[1])
             
         block_list.append(image_array_block_1)
+
+    # ------------------------- CASE 2 -------------------------
+
+
+    elif display_height <= 16 and display_width <=32:
+
+        if display_height == 14 and display_width == 28:
+            image_array = np.pad(image_array, pad_width=((1, 1), (1, 1)), mode='constant', constant_values=0)
+            image_array = np.pad(image_array, pad_width=((1, 1), (0, 0)), mode='constant', constant_values=0)
+
+        block_length = FGY_byte_split(hex(128))
+        image_array_block_1 = [0x30,0x31]
+
+        for i in block_length:
+            image_array_block_1.append(i)
+
+        for column in image_array:
+
+            top = FGY_bin_to_ascii(column[8:]) #TOP          #convert from binary data to hex values
+
+            image_array_block_1.append(top[0])
+            image_array_block_1.append(top[1])
+
+
+        for column in image_array:
+
+            btm = FGY_bin_to_ascii(column[:8]) #bottom
+
+            image_array_block_1.append(btm[0])
+            image_array_block_1.append(btm[1])
+
+
+        block_list.append(image_array_block_1)
         
 
         
-    # ------------------------- CASE 2 ------------------------- TESTED OK
+    # ------------------------- CASE 3 -------------------------
     elif display_height > 8 and display_width <= 96:
-        print("case 2")
-        block_number = 2
-        block_length = byte_split(hex(display_width*2))
+        block_length = FGY_byte_split(hex(display_width*2))
         
-        image_array_block_1 = [0x30,0x31]           #block IDs
+        image_array_block_1 = [0x30,0x31]
         image_array_block_2 = [0x30,0x32]
 
-        for i in block_length:                      #block lengths. In this cases both block are equal lengths
+        for i in block_length:
             image_array_block_1.append(i)
             image_array_block_2.append(i)
         
 
         for column in image_array:
             
-            tmp = bin_to_ascii(column[8:])          #convert from binary data to hex values
-            image_array_block_1.append(tmp[0])      #upper (1st) block
+            tmp = FGY_bin_to_ascii(column[8:])          #convert from binary data to hex values
+            image_array_block_1.append(tmp[0])      #top
             image_array_block_1.append(tmp[1])
             
-            tmp = bin_to_ascii(column[:8])
-            image_array_block_2.append(tmp[0])      #blower (2nd) block
+            tmp = FGY_bin_to_ascii(column[:8])
+            image_array_block_2.append(tmp[0])      #bottom
             image_array_block_2.append(tmp[1])      
 
         block_list.append(image_array_block_1)
         block_list.append(image_array_block_2)
             
-    # ------------------------ CASE 3 -------------------------- #untested, but very rare case
+    # ------------------------ CASE 4 --------------------------
     elif display_height <= 8 and display_width > 96:
-        print("case 3")
-        block_number = 2
-
-            
-        image_array_block_1 = [0x30,0x31]           #block IDs
+        
+        image_array_block_1 = [0x30,0x31]   
         image_array_block_2 = [0x30,0x32]
 
-        block_length = byte_split(hex(96/2))
+        block_length = FGY_byte_split(hex(display_width/2))
         for i in block_length:
             image_array_block_1.append(i)
-
-        block_length = byte_split(hex((display_width-96)/2))
-        for i in block_length:
             image_array_block_2.append(i)
  
         
-        for column in image_array[:96]:           #first 69 columns convert to hex
-            tmp = bin_to_ascii(column)
+        for column in image_array[:96]:           #first 100 pixels convert to hex
+            tmp = FGY_bin_to_ascii(column)
             image_array_block_1.append(tmp[0])
             image_array_block_1.append(tmp[1])
             
-        for column in image_array[96:]:           #all columns after 96 convert to hex
-            tmp = bin_to_ascii(column)
+        for column in image_array[96:]:           #all pixels after 100 convert to hex
+            tmp = FGY_bin_to_ascii(column)
             image_array_block_2.append(tmp[0])
             image_array_block_2.append(tmp[1])
 
         block_list.append(image_array_block_1)
         block_list.append(image_array_block_2)
 
-    # ------------------------ CASE 4 -------------------------- # TESTED OK 
+    # ------------------------ CASE 4 --------------------------
     elif display_height > 8 and display_width > 96:
-        block_number = 4
-        print("case 4")
         
-        block_length = byte_split(hex(96*2))
-        block2_length = byte_split(hex((display_width - 96)*2))
+        block_length = FGY_byte_split(hex(96*2))
+        block2_length = FGY_byte_split(hex((display_width - 96)*2))
         
         image_array_block_1 = [0x30,0x31]
         image_array_block_2 = [0x30,0x32]
@@ -297,23 +422,23 @@ def process_image(image_array):                 #this is where it gets nasty. Ta
         tmp_array1 = image_array[:96]
         tmp_array2 = image_array[96:]
 
-for column in tmp_array1:
+        for column in tmp_array1:
 
-            tmp = bin_to_ascii(column[8:])          #convert from binary data to hex values
+            tmp = FGY_bin_to_ascii(column[8:])          #convert from binary data to hex values
             image_array_block_1.append(tmp[0])      #top
             image_array_block_1.append(tmp[1])
 
-            tmp = bin_to_ascii(column[:8])          #convert from binary data to hex values
+            tmp = FGY_bin_to_ascii(column[:8])          #convert from binary data to hex values
             image_array_block_3.append(tmp[0])      #top
             image_array_block_3.append(tmp[1])
             
 
         for column in tmp_array2:
-            tmp = bin_to_ascii(column[8:])          #convert from binary data to hex values
+            tmp = FGY_bin_to_ascii(column[8:])          #convert from binary data to hex values
             image_array_block_2.append(tmp[0])      #top
             image_array_block_2.append(tmp[1])
 
-            tmp = bin_to_ascii(column[:8])          #convert from binary data to hex values
+            tmp = FGY_bin_to_ascii(column[:8])          #convert from binary data to hex values
             image_array_block_4.append(tmp[0])      #top
             image_array_block_4.append(tmp[1])
 
@@ -327,164 +452,111 @@ for column in tmp_array1:
     return block_list
 
 
-def send_image(image_array, address, protocol):     #use this image to handle sendling images.
-                                                    #params:
-                                                    #   -image array: 2D array of the image data. must be 1:1 the size of the display. each value must be a hexadecimal value.
-                                                    #               where the binary bit of the value is 1, the pixel on that postion will be flipped to the bright side.
-                                                    #   -address must be the pyhiscal address of the display
-                                                    # protocol can be 1 or 2, each is different. depends on the display you use.
-    if protocol == 1:
-        processed_image = process_image(image_array)    #this is the simple version, no pre-processing needed
+
+
+
+# ================================== >>> COMMON FUNCTIONS <<< =====================================
+
+def send_image(image_array, address, protocol):
+
+    protocol_manager(protocol)
+
+    if protocol == " FOK-GYEM (bkv)":
+        processed_image = FGY_process_image(image_array)
         
-    elif protocol == 2:                                 #in this more complicated version the first 32 columns are sent last. The first column sent it #33.
+    elif protocol == " Mobilinform (Volán)":
         new_image_array = list()
         for i in image_array[32:]:
             new_image_array.append(i)
         for i in image_array[:32]:
             new_image_array.append(i)
             
-        processed_image = process_image(new_image_array)
-        
-    converted_address = convert_address(address)        #for all image transmissions the beginning of the image data must be preceeded by the image start command from the valid commands list.
-    global common_delay
+        processed_image = FGY_process_image(new_image_array)
 
-    send(VALID_COMMANDS["image_start"])
-    sleep(common_delay)
-    
-    for block in processed_image:                   #finalizing: adding STX, address, checksum
-        block.insert(0, 2)                          #this could be optimized I know
-        block.insert(1, converted_address[0])
-        block.insert(2, converted_address[1])
-        checksum = calculate_checksum(block)
-        block.append(checksum[0])
-        block.append(checksum[1])
-        block.append(3)
-        byteliterals=bytes(block)
-        ser.write(byteliterals)
+    if protocol == " FOK-GYEM (bkv)" or protocol == " Mobilinform (Volán)":
+ 
+        converted_address = FGY_convert_address(address)
+        global common_delay
+
+        FGY_send_command(FGY_VALID_COMMANDS["image_start"], address)
         sleep(common_delay)
-    send(VALID_COMMANDS["image_end"])
-5    
     
-    
-# ____________________--------- EXAMPLES ---------- _____________________        
+        for block in processed_image:                   #finalizing: adding STX, address, checksum
+            block.insert(0, 2)
+            block.insert(1, converted_address[0])
+            block.insert(2, converted_address[1])
+            checksum = FGY_calculate_checksum(block)
+            block.append(checksum[0])
+            block.append(checksum[1])
+            block.append(3)
+            byteliterals=bytes(block)
+            ser.write(byteliterals)
+            sleep(common_delay)
+        FGY_send_command(FGY_VALID_COMMANDS["image_end"], address)
+        resp = FGY_req_ack(address)
+
+    return resp
         
-ports = serial_ports()
-print(ports)
-open_port(ports[0])     #change this to your desired port
-#open_port("COM2")      this also works
 
-print("clearing all displays")
-send(VALID_COMMANDS["Clear"])       #clear all displays
-sleep(1)                            #do not send commands with short interval
-print("self test in display #4")
-send(VALID_COMMANDS["Selftest"], 4) # starts self test on display address 4, note that the display will continue to do the selftest until it recieves another command
-sleep(5)
+def send_command(command, address, protocol):
+    protocol_manager(protocol)
 
+    if protocol == " FOK-GYEM (bkv)" or protocol == " Mobilinform (Volán)":
+        cmd_bytes = FGY_VALID_COMMANDS[command]
+        FGY_send_command(cmd_bytes, address)
+        #print("[SERIAL DRIVER]: FOK PROTOCOL", command)
 
+def protocol_manager(protocol):
+    global current_protocol
 
-#sending images: (for a 96x7 sized display, modify the example_image_array for different display sizes)
+    if current_protocol != protocol:
+        if protocol == " FOK-GYEM (bkv)" or protocol == " Mobilinform (Volán)":
+            ser.baudrate = 19200
+            ser.parity=serial.PARITY_SPACE
+            ser.stopbits=serial.STOPBITS_TWO 
+            ser.timeout = 0.3
+            print("[SERIAL DRIVER]: //Protocol manager// serial mode changed to FGY")
+            
+        current_protocol = protocol
 
-example_image_array = ([255, 255, 255, 255, 255, 255, 255],
- [  0,   0,   0, 255,   0,   0, 255],
- [  0,   0,   0, 255,   0,   0, 255],
- [  0,   0,   0,   0,   0,   0, 255],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0, 255, 255, 255, 255, 255,   0],
- [255,   0,   0,   0,   0,   0, 255],
- [255,   0,   0,   0,   0,   0, 255],
- [  0, 255, 255, 255, 255, 255,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [255, 255, 255, 255, 255, 255, 255],
- [  0,   0,   0, 255,   0,   0,   0],
- [  0,   0, 255,   0, 255,   0,   0],
- [255, 255,   0,   0,   0, 255, 255],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0, 255,   0,   0,   0,   0],
- [  0,   0, 255,   0,   0,   0,   0],
- [  0,   0, 255,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0, 255, 255, 255, 255, 255,   0],
- [255,   0,   0,   0,   0,   0, 255],
- [255,   0,   0, 255,   0,   0, 255],
- [  0, 255, 255, 255,   0, 255,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0, 255, 255, 255, 255],
- [255, 255, 255, 255,   0,   0,   0],
- [  0,   0,   0, 255, 255, 255, 255],
- [  0,   0,   0,   0,   0,   0,   0],
- [255, 255, 255, 255, 255, 255, 255],
- [255,   0,   0, 255,   0,   0, 255],
- [255,   0,   0, 255,   0,   0, 255],
- [255,   0,   0,   0,   0,   0, 255],
- [  0,   0,   0,   0,   0,   0,   0],
- [255, 255, 255, 255, 255, 255, 255],
- [  0,   0,   0,   0,   0, 255,   0],
- [  0,   0,   0,   0, 255,   0,   0],
- [  0,   0,   0,   0,   0, 255,   0],
- [255, 255, 255, 255, 255, 255, 255],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0, 255],
- [255, 255, 255, 255,   0,   0, 255],
- [  0,   0,   0,   0, 255,   0, 255],
- [  0,   0,   0,   0,   0, 255, 255],
- [  0,   0,   0,   0,   0,   0,   0],
- [255, 255,   0,   0,   0, 255, 255],
- [  0,   0, 255,   0, 255,   0,   0],
- [  0,   0,   0, 255,   0,   0,   0],
- [  0,   0, 255,   0, 255,   0,   0],
- [255, 255,   0,   0,   0, 255, 255],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0, 255,   0,   0, 255, 255,   0],
- [255,   0,   0, 255,   0,   0, 255],
- [255,   0,   0, 255,   0,   0, 255],
- [  0, 255, 255, 255, 255, 255,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0, 255, 255, 255, 255, 255,   0],
- [255,   0,   0, 255,   0,   0, 255],
- [255,   0,   0, 255,   0,   0, 255],
- [  0, 255, 255,   0,   0, 255,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0],
- [  0,   0,   0,   0,   0,   0,   0])
-#send image command,
+         
+#open_port("COM8")
+#protocol_manager(" FOK-GYEM (bkv)")
+#while 1:
+#    resp = ser.readlines()
 
-print("sending image to display #4, protocol type 1")
-send_image(example_image_array, 4, 1)   #send the example image array to display address 4, with protocol type 1
+#    if resp != []:
+#        print(resp)
 
 
+
+
+#FGY_send_command(VALID_COMMANDS["Clear"])
+
+
+'''sending images:
+
+
+read image array as:
+make two arrays for the two blocks (top 8 rows and bottom 8 rows)
+    array_top and array_bottom
+    each array should start with the block ID (1 and 2, split into to bytes using the FGY_byte_split() function)
+    then it should contain the block length (display_width * 2, split into to bytes using the FGY_byte_split() function)
+
+    then
+    
+read every column starting from 0
+    split each column as:
+    first 8 values goes into array_bottom
+    last 8 values goes into array_top
+
+add header to each array:
+    STX, display address
+    CRC, ETX
+
+send header + 30 30 30 32 30 43 + footer [= start image transmission // ---- send(VALID_COMMANDS["image_start"])]
+send image array_top
+send image array_bottom
+send header + 30 30 30 32 31 34 + footer [= end image transmission  -------- send(VALID_COMMANDS["image_end"])]'''
 
     
