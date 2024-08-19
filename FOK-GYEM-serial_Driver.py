@@ -315,7 +315,7 @@ def FGY_process_image(image_array):
             
         block_list.append(image_array_block_1)
 
-    # ------------------------- CASE 2 -------------------------
+    # ------------------------- CASE 2 -------------------------            displays smaller than or equal to 16x32
 
 
     elif display_height <= 16 and display_width <=32:
@@ -350,7 +350,7 @@ def FGY_process_image(image_array):
         
 
         
-    # ------------------------- CASE 3 -------------------------
+    # ------------------------- CASE 3 -------------------------            DISPLAYS smaller than or equal to 8 pixels, but smaller than or equal to 96px
     elif display_height > 8 and display_width <= 96:
         block_length = FGY_byte_split(hex(display_width*2))
         
@@ -375,7 +375,7 @@ def FGY_process_image(image_array):
         block_list.append(image_array_block_1)
         block_list.append(image_array_block_2)
             
-    # ------------------------ CASE 4 --------------------------
+    # ------------------------ CASE 5 --------------------------            DISPLAYS smaller than or equal to 8 pixels, but wider than 96px
     elif display_height <= 8 and display_width > 96:
         
         image_array_block_1 = [0x30,0x31]   
